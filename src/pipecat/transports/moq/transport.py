@@ -44,6 +44,24 @@ protocol negotiation, typed text input, function-call results, etc).
 This makes MoQ a full bidirectional RTVI transport, on par with the
 Daily and WebSocket transports.
 
+The two tracks differ in what a late subscriber sees. The transcript
+stream is replayed from its first record, so a bot that comes up after
+the browser still receives the browser's ``client-ready``. The audio
+track is live media with no replay: frames written before a subscriber
+attaches are gone. A bot that speaks as soon as it sees ``client-ready``
+would therefore produce text the browser shows but audio it never
+hears, so :class:`MOQOutputTransport` holds its first audio frame until
+the track has a subscriber (see ``audio_out_subscriber_timeout``).
+
+The audio track is also kept continuously live: whenever the pipeline
+has no audio scheduled ahead of wall-clock, the client writes paced
+silence at the Opus frame cadence (see ``audio_out_keepalive``). The
+browser player anchors its playhead on the first frame it receives and
+skips frames scheduled in the past, so a track that only carries speech
+turns every utterance into a stream start whose first moments are lost
+to player warm-up. With the timeline always flowing, speech is just the
+next frames on it.
+
 Two modes:
 
 - **Server mode** (``serve=True``): the bot binds its own UDP socket via
@@ -322,6 +340,12 @@ class MOQParams(TransportParams):
             an alternative to disabling ``verify_ssl``, not a companion.
         connection_timeout: Seconds to wait for the peer broadcast to be
             announced before giving up.
+        audio_out_subscriber_timeout: Seconds the output transport holds
+            its first audio frame waiting for the peer to subscribe to the
+            bot's audio track. The track is live media with no replay, so
+            audio written before that subscription is lost. On timeout the
+            audio is sent anyway with a warning. ``0`` or ``None`` disables
+            the wait.
         serve: When ``True``, the bot binds its own UDP socket and accepts
             incoming MOQ sessions instead of dialing a relay.
         bind: Local UDP socket bind address. In serve mode it's the
@@ -367,6 +391,12 @@ class MOQParams(TransportParams):
             player's buffer ceiling (``MoqTransportOptions.audioBufferMaxMs``,
             30s) so the producer self-limits below the player's drop
             ceiling and the player never has to drop.
+        audio_out_keepalive: Keep the bot's audio track live between
+            utterances by writing paced silence (one ``audio_out_frame_ms``
+            frame at a time) whenever no pipeline audio is scheduled ahead
+            of wall-clock. Silence is never interleaved into buffered
+            speech. Off, the track only carries speech and the subscriber
+            treats each utterance as a stream start.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -385,6 +415,7 @@ class MOQParams(TransportParams):
     client_tls_roots: list[str] | None = None
     client_tls_fingerprints: list[str] | None = None
     connection_timeout: float = 30.0
+    audio_out_subscriber_timeout: float | None = 15.0
     serve: bool = False
     bind: str | None = None
     serve_bind: str | None = None
@@ -396,6 +427,7 @@ class MOQParams(TransportParams):
     audio_in_max_latency_ms: int = 500
     audio_out_frame_ms: int = 20
     audio_out_max_buffer_ms: int = 25000
+    audio_out_keepalive: bool = True
 
     @model_validator(mode="before")
     @classmethod
@@ -432,6 +464,7 @@ class MOQCallbacks(BaseModel):
         on_client_connected: Called when the peer's broadcast is announced.
         on_client_disconnected: Called when the peer's broadcast goes away.
         on_track_subscribed: Called when a remote track subscription succeeds.
+        on_audio_subscribed: Called the first time a peer subscribes to the bot's audio track.
         on_error: Called when the underlying transport errors.
         on_audio_received: Called with decoded mono PCM audio from the peer's audio track.
         on_message_received: Called with each RTVI message from the peer's transcript stream.
@@ -442,6 +475,7 @@ class MOQCallbacks(BaseModel):
     on_client_connected: Callable[[], Awaitable[None]]
     on_client_disconnected: Callable[[], Awaitable[None]]
     on_track_subscribed: Callable[[MOQTrack], Awaitable[None]]
+    on_audio_subscribed: Callable[[], Awaitable[None]]
     on_error: Callable[[str, Exception], Awaitable[None]]
     on_audio_received: Callable[[bytes, int], Awaitable[None]]
     on_message_received: Callable[[dict], Awaitable[None]]
@@ -525,6 +559,14 @@ class MOQTransportClient:
         # wall-clock duration for pacing.
         self._audio_out: moq.AudioProducer | None = None
         self._audio_out_sample_rate: int | None = None
+        # Set once the audio track has had a subscriber. The watch task
+        # awaits ``AudioProducer.used()`` for the session's lifetime and is
+        # the only thing that sets the event.
+        self._audio_subscribed = asyncio.Event()
+        self._audio_subscriber_task: asyncio.Task | None = None
+        # Writes paced silence while the pipeline has nothing scheduled;
+        # see :meth:`start_audio_keepalive`.
+        self._audio_keepalive_task: asyncio.Task | None = None
         # Wall-clock target for the next publish_audio write. ``None``
         # means "reset" — the next write anchors to ``time.monotonic()``.
         self._publish_audio_clock: float | None = None
@@ -684,6 +726,13 @@ class MOQTransportClient:
         self._publish_audio_clock = None
         self._open_audio_track(self._audio_out_sample_rate)
 
+        # A watch still waiting on the retired track would never see the
+        # subscriber, who follows the catalog to the successor.
+        watch, self._audio_subscriber_task = self._audio_subscriber_task, None
+        if watch is not None and not self._audio_subscribed.is_set():
+            watch.cancel()
+            self._ensure_audio_subscriber_watch()
+
     async def publish_audio(self, audio: bytes):
         """Push a PCM chunk to the bot's audio track with real PTS, paced to a cap.
 
@@ -744,8 +793,10 @@ class MOQTransportClient:
         session-ending and tear the transport down.
 
         No-op when no audio has been published yet or the clock has
-        already caught up. Capped at ``audio_out_max_buffer_ms`` as a
-        safety net so a bogus clock value can't stall shutdown.
+        already caught up. With the keepalive running the clock never
+        gets far ahead while idle, so after a quiet period this is just
+        the margin. Capped at ``audio_out_max_buffer_ms`` as a safety net
+        so a bogus clock value can't stall shutdown.
         """
         if self._publish_audio_clock is None:
             return
@@ -756,6 +807,146 @@ class MOQTransportClient:
         drain = min(pending, cap) + jitter_buffer_margin_s
         logger.debug(f"MOQ: draining {drain:.2f}s of buffered outbound audio before shutdown")
         await asyncio.sleep(drain)
+
+    def start_audio_keepalive(self):
+        """Keep the audio track live with paced silence while the pipeline is idle.
+
+        Called by :meth:`MOQOutputTransport.start`. No-op when
+        ``audio_out_keepalive`` is off, the track isn't open, or the
+        keepalive is already running.
+        """
+        if (
+            not self._params.audio_out_keepalive
+            or self._audio_out is None
+            or self._audio_keepalive_task is not None
+        ):
+            return
+        assert self._task_manager is not None, (
+            "MOQTransportClient.setup() must run before the audio keepalive; "
+            "input/output processors forward setup from their own setup()."
+        )
+        self._audio_keepalive_task = self._task_manager.create_task(
+            self._audio_keepalive(), f"{self}::moq_audio_keepalive"
+        )
+
+    async def stop_audio_keepalive(self):
+        """Stop writing keepalive silence.
+
+        Runs before :meth:`wait_for_audio_drain` on shutdown so the final
+        utterance's frames are the last ones written.
+        """
+        task, self._audio_keepalive_task = self._audio_keepalive_task, None
+        if task is not None and self._task_manager is not None:
+            await self._task_manager.cancel_task(task)
+
+    async def _audio_keepalive(self):
+        """Write one frame of silence per ``audio_out_frame_ms`` tick while idle.
+
+        Ticks follow a monotonic schedule rather than a fixed sleep so the
+        cadence doesn't drift. Each tick writes silence only when the
+        pacing clock is within one frame of wall-clock, i.e. nothing from
+        the pipeline is scheduled beyond this slot; the write goes through
+        :meth:`publish_audio` so it shares the PTS and pacing bookkeeping
+        and the timeline stays contiguous across speech and silence. The
+        one-frame allowance absorbs scheduler jitter: the clock is
+        anchored to the wall-clock of each write, so a tick that fires
+        less late than the previous one sees the clock slightly ahead of
+        ``now`` and must still fill its slot.
+        """
+        assert self._audio_out_sample_rate
+        frame_s = self._params.audio_out_frame_ms / 1000.0
+        silence = b"\x00" * (int(self._audio_out_sample_rate * frame_s) * 2)
+        next_tick = time.monotonic()
+        while True:
+            now = time.monotonic()
+            clock = self._publish_audio_clock
+            if clock is None or clock <= now + frame_s:
+                await self.publish_audio(silence)
+            next_tick += frame_s
+            delay = next_tick - time.monotonic()
+            if delay < 0:
+                # Fell behind (the loop stalled); resume from now rather
+                # than bursting to catch up.
+                next_tick = time.monotonic()
+                delay = 0
+            await asyncio.sleep(delay)
+
+    async def wait_for_audio_subscriber(self, timeout: float | None) -> bool:
+        """Wait until the bot's audio track has at least one subscriber.
+
+        Args:
+            timeout: Seconds to wait. ``0`` or ``None`` returns immediately.
+
+        Returns:
+            ``True`` once a subscriber is attached, or without waiting when
+            audio output is disabled or ``timeout`` is disabled. ``False``
+            when ``timeout`` elapses (logged as a warning) or the session is
+            torn down while waiting.
+        """
+        if self._audio_out is None or not timeout:
+            return True
+        if self._audio_subscribed.is_set():
+            return True
+
+        watch = self._ensure_audio_subscriber_watch()
+        if watch is None:
+            return True
+
+        track = self._audio_track_name
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(asyncio.shield(watch), timeout=timeout)
+        except TimeoutError:
+            logger.warning(
+                f"MOQ: no subscriber on audio track {track!r} within {timeout}s; "
+                "sending audio anyway"
+            )
+            return False
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if watch.cancelled() and (current is None or not current.cancelling()):
+                # The session was torn down under us, not the caller.
+                return False
+            raise
+
+        if not self._audio_subscribed.is_set():
+            return False
+        logger.debug(
+            f"MOQ: audio track {track!r} has a subscriber "
+            f"(waited {time.monotonic() - started:.2f}s)"
+        )
+        return True
+
+    def _ensure_audio_subscriber_watch(self) -> asyncio.Task | None:
+        """Start the audio subscriber watch if the track is open and it isn't running."""
+        if self._audio_out is None:
+            return None
+        if self._audio_subscriber_task is None:
+            assert self._task_manager is not None, (
+                "MOQTransportClient.setup() must run before the audio subscriber watch; "
+                "input/output processors forward setup from their own setup()."
+            )
+            self._audio_subscriber_task = self._task_manager.create_task(
+                self._watch_audio_subscriber(self._audio_out), f"{self}::moq_audio_subscriber"
+            )
+        return self._audio_subscriber_task
+
+    async def _watch_audio_subscriber(self, producer: "moq.AudioProducer"):
+        """Resolve :attr:`_audio_subscribed` on the track's first subscriber."""
+        try:
+            await producer.used()
+        except _MoqError as e:
+            logger.debug(f"MOQ: audio subscriber watch ended: {e}")
+            return
+        self._audio_subscribed.set()
+        logger.debug(f"MOQ: audio track {self._audio_track_name!r} subscribed")
+        await self._callbacks.on_audio_subscribed()
+
+    async def _cancel_audio_subscriber_watch(self):
+        """Stop the audio subscriber watch, releasing its pending ``used()`` future."""
+        task, self._audio_subscriber_task = self._audio_subscriber_task, None
+        if task is not None and self._task_manager is not None:
+            await self._task_manager.cancel_task(task)
 
     def publish_transcript(self, message):
         """Append an RTVI message to the transcript JSON stream.
@@ -829,6 +1020,7 @@ class MOQTransportClient:
                     f"audio: {self._params.audio_out_track!r})"
                 )
                 await self._callbacks.on_connected()
+                self._ensure_audio_subscriber_watch()
 
                 # In serve mode, drive the accept loop in the background.
                 # serve() holds each session task until the session closes,
@@ -868,6 +1060,8 @@ class MOQTransportClient:
                 logger.opt(exception=e).error(f"MOQ transport error: {e}")
                 await self._callbacks.on_error(str(e), e)
         finally:
+            await self.stop_audio_keepalive()
+            await self._cancel_audio_subscriber_watch()
             self._audio_out = None
             self._cert_fingerprints = []
             await self._callbacks.on_disconnected()
@@ -1133,6 +1327,9 @@ class MOQTransportClient:
         except Exception as e:
             logger.debug(f"MOQ: could not send session-ending notification: {e}")
 
+        await self.stop_audio_keepalive()
+        await self._cancel_audio_subscriber_watch()
+
         # Cancel any open consumers so their async iterations terminate.
         for c in self._active_consumers:
             try:
@@ -1186,6 +1383,7 @@ class MOQTransportClient:
         The session is only actually disconnected once every holder
         (input and output) has released it — see :attr:`_holders`.
         """
+        await self.stop_audio_keepalive()
         if drain:
             await self.wait_for_audio_drain()
         self._holders -= 1
@@ -1346,6 +1544,10 @@ class MOQOutputTransport(BaseOutputTransport):
         super().__init__(params, **kwargs)
         self._client = client
         self._params = params
+        # Whether the first-audio-frame wait for a subscriber has run to
+        # completion (subscribed or timed out). A wait cut short by an
+        # interruption runs again on the next utterance.
+        self._audio_subscriber_settled = False
 
     async def setup(self, setup: FrameProcessorSetup):
         """Forward setup to the shared MOQTransportClient so it can create tasks.
@@ -1373,6 +1575,7 @@ class MOQOutputTransport(BaseOutputTransport):
         """
         await super().start(frame)
         await self.set_transport_ready(frame)
+        self._client.start_audio_keepalive()
 
     async def stop(self, frame: EndFrame):
         """Stop the MOQ output transport.
@@ -1413,17 +1616,35 @@ class MOQOutputTransport(BaseOutputTransport):
         await self._client.cleanup()
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        """Publish a fresh audio track on interruption.
+        """Hold the first audio frame for a subscriber; publish a fresh track on interruption.
 
-        The base class drains the queued audio and stops the writer first,
-        so the track is retired with no writes still racing it. Everything
-        the retired track carried is discarded with it; the next utterance
-        goes out on the new one.
+        The bot's audio track is live media with no replay, so audio
+        written before the peer subscribes is lost. The wait runs here, on
+        the processor's frame task: later frames stay queued in order
+        behind it, and an interruption or ``CancelFrame`` cancels it.
+        ``start()`` runs on the system-frame task while data frames are
+        already being dispatched, so a wait there would drop them and
+        stall interruptions; a wait inside ``write_audio_frame`` would
+        count against ``audio_out_write_timeout_secs`` and write the peer
+        off as gone. The pacing clock in ``publish_audio`` is anchored on
+        the first write, so the wait doesn't skew it.
+
+        On interruption, the base class drains the queued audio and stops
+        the writer first, so the track is retired with no writes still
+        racing it. Everything the retired track carried is discarded with
+        it; the next utterance goes out on the new one.
 
         Args:
             frame: The frame to process.
             direction: The direction of frame flow in the pipeline.
         """
+        if (
+            isinstance(frame, OutputAudioRawFrame)
+            and direction == FrameDirection.DOWNSTREAM
+            and not self._audio_subscriber_settled
+        ):
+            await self._client.wait_for_audio_subscriber(self._params.audio_out_subscriber_timeout)
+            self._audio_subscriber_settled = True
         await super().process_frame(frame, direction)
         if isinstance(frame, InterruptionFrame):
             self._client.restart_audio_track()
@@ -1484,6 +1705,8 @@ class MOQTransport(BaseTransport):
     - ``on_client_connected`` — peer broadcast announced (client joined)
     - ``on_client_disconnected`` — peer broadcast went away
     - ``on_track_subscribed`` — remote track subscription succeeded
+    - ``on_audio_subscribed`` — a peer subscribed to the bot's audio track
+      (fires once per session)
     - ``on_error`` — error in the underlying transport
     """
 
@@ -1516,6 +1739,7 @@ class MOQTransport(BaseTransport):
             on_client_connected=self._on_client_connected,
             on_client_disconnected=self._on_client_disconnected,
             on_track_subscribed=self._on_track_subscribed,
+            on_audio_subscribed=self._on_audio_subscribed,
             on_error=self._on_error,
             on_audio_received=self._on_audio_received,
             on_message_received=self._on_message_received,
@@ -1538,6 +1762,7 @@ class MOQTransport(BaseTransport):
         self._register_event_handler("on_client_connected")
         self._register_event_handler("on_client_disconnected")
         self._register_event_handler("on_track_subscribed")
+        self._register_event_handler("on_audio_subscribed")
         self._register_event_handler("on_error")
 
     def input(self) -> MOQInputTransport:
@@ -1569,6 +1794,26 @@ class MOQTransport(BaseTransport):
         """
         await self._client.disconnect()
 
+    async def wait_for_audio_subscriber(self, timeout: float | None = None) -> bool:
+        """Wait until a peer has subscribed to the bot's audio track.
+
+        The output transport already holds its first audio frame on this;
+        call it directly to gate something else on the peer being able to
+        hear the bot.
+
+        Args:
+            timeout: Seconds to wait. Defaults to
+                ``MOQParams.audio_out_subscriber_timeout``.
+
+        Returns:
+            ``True`` once a subscriber is attached (or immediately when
+            audio output or the wait is disabled), ``False`` on timeout or
+            if the session ends first.
+        """
+        if timeout is None:
+            timeout = self._params.audio_out_subscriber_timeout
+        return await self._client.wait_for_audio_subscriber(timeout)
+
     # ------------------------------------------------------------------
     # MOQTransportClient callbacks.
     # ------------------------------------------------------------------
@@ -1596,6 +1841,10 @@ class MOQTransport(BaseTransport):
             track: The subscribed track's identity.
         """
         await self._call_event_handler("on_track_subscribed", track)
+
+    async def _on_audio_subscribed(self):
+        """Handle the first subscription to the bot's audio track."""
+        await self._call_event_handler("on_audio_subscribed")
 
     async def _on_error(self, message: str, exception: Exception):
         """Handle an error from the underlying MOQ transport.

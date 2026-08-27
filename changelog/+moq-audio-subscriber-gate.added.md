@@ -1,0 +1,1 @@
+- Added `MOQParams.audio_out_subscriber_timeout`, an `on_audio_subscribed` transport event that fires when a peer first subscribes to the bot's audio track, and `MOQTransport.wait_for_audio_subscriber()` for bots that want to gate something themselves on the peer being able to hear the bot.
