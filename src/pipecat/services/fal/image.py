@@ -26,7 +26,7 @@ from pipecat.frames.frames import ErrorFrame, Frame, URLImageRawFrame
 from pipecat.services.image_service import ImageGenService
 from pipecat.services.settings import ImageGenSettings
 from pipecat.utils.deprecation import deprecated
-from pipecat.utils.types import NOT_GIVEN, NotGiven
+from pipecat.utils.types import NOT_GIVEN, NotGiven, is_given
 
 
 @dataclass
@@ -42,6 +42,9 @@ class FalImageGenSettings(ImageGenSettings):
         expand_prompt: Whether to automatically expand/enhance the prompt.
         enable_safety_checker: Whether to enable content safety filtering.
         format: Output image format.
+        negative_prompt: Details to keep out of the generated image. Sent only when set.
+        guidance_scale: CFG scale, how closely generation follows the prompt. Sent only
+            when set.
     """
 
     seed: int | None | NotGiven = field(default_factory=lambda: NOT_GIVEN)
@@ -51,6 +54,8 @@ class FalImageGenSettings(ImageGenSettings):
     expand_prompt: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     enable_safety_checker: bool | NotGiven = field(default_factory=lambda: NOT_GIVEN)
     format: str | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    negative_prompt: str | NotGiven = field(default_factory=lambda: NOT_GIVEN)
+    guidance_scale: float | NotGiven = field(default_factory=lambda: NOT_GIVEN)
 
     def to_api_arguments(self) -> dict[str, Any]:
         """Build the Fal API arguments dict from settings, excluding None values."""
@@ -63,6 +68,10 @@ class FalImageGenSettings(ImageGenSettings):
         args["expand_prompt"] = self.expand_prompt
         args["enable_safety_checker"] = self.enable_safety_checker
         args["format"] = self.format
+        if is_given(self.negative_prompt):
+            args["negative_prompt"] = self.negative_prompt
+        if is_given(self.guidance_scale):
+            args["guidance_scale"] = self.guidance_scale
         return args
 
 
